@@ -1,0 +1,125 @@
+-- Stable withdrawal requests for V7 settlement allocations.
+--
+-- A partner requests release of unused allocation funds through this
+-- template without exercising any core template. The actor signs and may
+-- cancel. The venue may reject or fulfill. Fulfillment cancels the
+-- supplied allocations and returns the released holdings. The off-ledger
+-- worker fulfills a request only after it confirms that the actor and
+-- pool have no unsettled V7 debits.
+
+module TC.OrderV2.Withdrawal
+  ( WithdrawalRequest(..)
+  , WithdrawalRequest_Cancel(..)
+  , WithdrawalRequest_Reject(..)
+  , WithdrawalRequest_Fulfill(..)
+  , WithdrawalRequest_Fulfill_Result(..)
+  , RejectReason(..)
+  , withdrawalAllocationFunding
+  ) where
+
+import DA.Foldable (forA_)
+import DA.Optional (fromOptional)
+import DA.TextMap qualified as TextMap
+
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
+import Splice.TokenStandard.Utils qualified as TokenStandard
+
+import TC.OrderV2.Allocation
+  ( CheckAllocArgs(..)
+  , checkAllocation
+  , tcSettlementId
+  )
+
+data RejectReason
+  = RejectReason_PendingSettlements
+  | RejectReason_InsufficientFunds
+  | RejectReason_OtherReason Text
+  deriving (Eq, Show)
+
+template WithdrawalRequest
+  with
+    actor : Party
+    venue : Party
+    ammId : Text
+    instrument : InstrumentId
+    createdAt : Time
+  where
+    signatory actor
+    observer venue
+
+    -- | The actor cancels the request.
+    choice WithdrawalRequest_Cancel : ()
+      controller actor
+      do pure ()
+
+    -- | The venue declines the request, for example because pending
+    -- settlements still need the allocations.
+    choice WithdrawalRequest_Reject : ()
+      with
+        reason : RejectReason
+      controller venue
+      do pure ()
+
+    -- | The venue releases the named allocations back to the actor.
+    choice WithdrawalRequest_Fulfill : WithdrawalRequest_Fulfill_Result
+      with
+        allocations : [(ContractId AllocationV2.Allocation, ExtraArgs)]
+      controller venue
+      do
+        require "Withdrawal must name at least one allocation" $ not $ null allocations
+        TokenStandard.requireUnique "withdrawal allocation contract IDs" (map fst allocations)
+        availableTotal <- sum <$> forA allocations \(allocationCid, _) ->
+          withdrawalAllocationFunding this allocationCid
+        require "Withdrawal allocations must hold funding" $ availableTotal > 0.0
+        cancelResults <- forA allocations \(allocationCid, extraArgs) ->
+          exercise allocationCid $ AllocationV2.Allocation_Cancel with
+            actors = [venue]
+            extraArgs
+        forA_ cancelResults $ \result ->
+          case result.output of
+            AllocationV2.AllocationResult_Cancelled -> pure ()
+            output -> fail $ "Expected the withdrawal allocation to cancel, but got " <> show output
+        pure WithdrawalRequest_Fulfill_Result with
+          withdrawnTotal = availableTotal
+          allocationCids = map fst allocations
+          releasedHoldingCids = concat
+            [ fromOptional [] $ TextMap.lookup instrument.id result.authorizerHoldingCids
+            | result <- cancelResults
+            ]
+
+-- | Validate that an allocation is the actor's committed settlement
+-- allocation for the request's pool and instrument, and return the
+-- funding it locked for that instrument.
+withdrawalAllocationFunding
+  : WithdrawalRequest
+  -> ContractId AllocationV2.Allocation
+  -> Update Decimal
+withdrawalAllocationFunding request allocationCid = do
+  checked <- assertE =<< checkAllocation (CheckAllocArgs with
+    venue = request.venue
+    settlementId = tcSettlementId
+    ammId = request.ammId
+    authorizerOwner = request.actor
+    instrumentOpt = Some request.instrument
+    poolInstruments = [request.instrument]) allocationCid
+  pure $ fromOptional 0.0 $
+    TextMap.lookup request.instrument.id checked.nextIterationFunding
+
+data WithdrawalRequest_Fulfill_Result = WithdrawalRequest_Fulfill_Result
+  with
+    withdrawnTotal : Decimal
+    allocationCids : [ContractId AllocationV2.Allocation]
+    releasedHoldingCids : [ContractId HoldingV2.Holding]
+  deriving (Eq, Show)
+
+-- Local assertion helpers. The stable package does not import core helpers.
+require : Text -> Bool -> Update ()
+require msg cond = if cond then pure () else fail msg
+
+assertE : Either Text a -> Update a
+assertE = \case
+  Right a -> pure a
+  Left msg -> fail msg

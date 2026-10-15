@@ -1,0 +1,610 @@
+-- Stable factory, order, and result contracts for Tradecraft V7 pools.
+--
+-- Partners create, cancel, and observe orders, and read results, with
+-- only this package and their Token Standard packages. The venue and the
+-- vault prepare funding and complete execution. This module never calls
+-- Tradecraft core code and does not recalculate the AMM price.
+
+module TC.OrderV2
+  ( Factory(..)
+  , Factory_CreateOrders(..)
+  , Factory_CreateOrders_Result(..)
+  , Factory_CreateStandingAllocation(..)
+  , Factory_CreateStandingAllocation_Result(..)
+  , Factory_FundStandingAllocation_Result(..)
+  , Factory_FundStandingAllocation(..)
+  , Order(..)
+  , Order_Cancel(..)
+  , Order_Expire(..)
+  , Order_PrepareFunding(..)
+  , Order_PrepareFunding_Result(..)
+  , Order_Complete(..)
+  , Result(..)
+  , Result_MarkSettled(..)
+  , validateOrderStatic
+  , validFunding
+  ) where
+
+import DA.Foldable (forA_)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Optional (fromOptional)
+import DA.Set qualified as Set
+import DA.TextMap qualified as TextMap
+
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.HoldingV1 (InstrumentId(..))
+import Splice.Api.Token.HoldingV1 qualified as HoldingV1
+import Splice.Api.Token.HoldingV2 (Holding)
+import Splice.Api.Token.TransferInstructionV1 qualified as TransferInstructionV1
+
+import TC.OrderV2.Allocation
+  ( CheckAllocArgs(..)
+  , CreateSettlementAllocationArgs(..)
+  , FundSettlementAllocationArgs(..)
+  , acceptTransferInstruction
+  , assertE
+  , checkAllocation
+  , createSettlementAllocation
+  , fundSettlementAllocation
+  , prepareDebit
+  , require
+  , requireE
+  , tcSettlementId
+  , requireSome
+  , validateContext
+  )
+import TC.OrderV2.Types
+
+-- | Stable, immutable description of one V7 pool. The core's venue
+-- controlled pool creation choice creates the factory. Partners receive
+-- its disclosure; they never submit a command against the core pool
+-- rules.
+template Factory
+  with
+    venue : Party
+    vault : Party
+    pool : PoolRef
+    tickSpacing : Int
+  where
+    signatory venue, vault
+
+    ensure
+      tickSpacing > 0
+      && pool.venue == venue
+      && pool.vault == vault
+      && pool.instrument1 /= pool.instrument2
+
+    -- | Create one order per specification, in input order. The factory's
+    -- signatories supply the vault authority that the order signature
+    -- needs. Creation reserves and consumes nothing.
+    nonconsuming choice Factory_CreateOrders : Factory_CreateOrders_Result
+      with
+        actor : Party
+        specs : [OrderSpec]
+      controller actor
+      do
+        require "Order batch must not be empty" $ not $ null specs
+        now <- getTime
+        forA_ specs \spec -> do
+          assertE $ validateOrderStatic pool tickSpacing spec
+          validateFundingSources actor pool spec.input.funding
+        orderCids <- forA specs \spec ->
+          create Order with
+            actor
+            venue
+            vault
+            pool
+            tickSpacing
+            operation = spec.operation
+            input = spec.input
+            output = spec.output
+            createdAt = now
+            expiresAt = spec.expiresAt
+        pure Factory_CreateOrders_Result with orderCids
+
+    -- | Create a standing settlement allocation for the actor. The choice
+    -- arguments carry Token Standard interface IDs and extra arguments.
+    nonconsuming choice Factory_CreateStandingAllocation : Factory_CreateStandingAllocation_Result
+      with
+        actor : Party
+        args : CreateSettlementAllocationArgs
+      controller actor
+      do
+        require "Allocation actor must be the caller" $
+          args.allocationActor == actor
+        require "Allocation must belong to this pool" $
+          args.ammId == pool.ammId && args.instruments == factoryInstruments this
+        require "Allocation venue must be the factory venue" $
+          args.venue == venue
+        (allocationCid, changeCids) <- createSettlementAllocation args
+        pure Factory_CreateStandingAllocation_Result with
+          allocationCid
+          changeHoldingCids = concatMap snd (TextMap.toList changeCids)
+
+    -- | Fund a standing settlement allocation from the actor's holdings.
+    nonconsuming choice Factory_FundStandingAllocation : Factory_FundStandingAllocation_Result
+      with
+        actor : Party
+        args : FundSettlementAllocationArgs
+      controller actor
+      do
+        require "Allocation actor must be the caller" $
+          args.allocationActor == actor
+        require "Funding must belong to this pool" $
+          args.ammId == pool.ammId && args.instruments == factoryInstruments this
+        require "Funding venue must be the factory venue" $
+          args.venue == venue
+        (successorCid, changeCids) <- fundSettlementAllocation args
+        pure Factory_FundStandingAllocation_Result with
+          allocationCid = successorCid
+          changeHoldingCids = concatMap snd (TextMap.toList changeCids)
+
+factoryInstruments : Factory -> [InstrumentId]
+factoryInstruments f = [f.pool.instrument1, f.pool.instrument2]
+
+data Factory_CreateOrders_Result = Factory_CreateOrders_Result
+  with
+    orderCids : [ContractId Order]
+  deriving (Eq, Show)
+
+data Factory_CreateStandingAllocation_Result = Factory_CreateStandingAllocation_Result
+  with
+    allocationCid : ContractId AllocationV2.Allocation
+    changeHoldingCids : [ContractId Holding]
+  deriving (Eq, Show)
+
+data Factory_FundStandingAllocation_Result = Factory_FundStandingAllocation_Result
+  with
+    allocationCid : ContractId AllocationV2.Allocation
+    -- ^ The surviving allocation ID. Settlement archives the funded one.
+    changeHoldingCids : [ContractId Holding]
+  deriving (Eq, Show)
+
+-- | One V7 order. The actor and the vault sign; the venue observes.
+template Order
+  with
+    actor : Party
+    venue : Party
+    vault : Party
+    pool : PoolRef
+    tickSpacing : Int
+    operation : Operation
+    input : Input
+    output : Output
+    createdAt : Time
+    expiresAt : Optional Time
+  where
+    signatory actor, vault
+    observer venue
+
+    ensure
+      pool.venue == venue
+      && pool.vault == vault
+      && case validateOrderStatic pool tickSpacing (OrderSpec with
+        operation
+        input
+        output
+        expiresAt) of
+          Right () -> True
+          Left _ -> False
+
+    -- | Cancellation consumes no funds. Standing allocations stay live.
+    choice Order_Cancel : ContractId Result
+      controller actor
+      do
+        now <- getTime
+        createResult self this now OutcomeCancelled Map.empty Map.empty None
+
+    -- | The actor retires an expired order. Expiry must have passed.
+    choice Order_Expire : ContractId Result
+      controller actor
+      do
+        now <- getTime
+        expiry <- requireSome "Order has no expiry" expiresAt
+        require "Order expiry must have passed" $ now > expiry
+        createResult self this now (OutcomeRejected "Order expired") Map.empty Map.empty None
+
+    -- | Prepare funding for execution. The venue and the vault supply
+    -- the planned debit per instrument and the token contexts. The choice
+    -- accepts pending transfers, allocates holdings, and returns the
+    -- selected allocation IDs and every change holding. It fetches no
+    -- core contract.
+    nonconsuming choice Order_PrepareFunding : Order_PrepareFunding_Result
+      with
+        plannedDebits : [PlannedDebit]
+        plannedOutputs : Map InstrumentId Decimal
+        contexts : [InstrumentContext]
+      controller venue, vault
+      do
+        now <- getTime
+        require "Order must not be expired" $ notExpired expiresAt now
+        orderRecord <- fetch self
+        require "Planned debits must name distinct instruments" $
+          allDistinct (map (.instrument) plannedDebits)
+        forA_ plannedDebits \debit -> validateDebit orderRecord debit
+        validatePreparedOutputs orderRecord plannedOutputs
+        let ctxByInstr = Map.fromList [(ctx.instrument, ctx) | ctx <- contexts]
+            requiredInstruments =
+              map (.instrument) plannedDebits
+                <> [instrument | (instrument, amount) <- Map.toList plannedOutputs, amount > 0.0]
+        require "Contexts must name distinct instruments" $
+          Map.size ctxByInstr == length contexts
+        require "Each payment instrument needs a preparation context" $
+          all (`Map.member` ctxByInstr) requiredInstruments
+        prepared <- forA (Map.toList ctxByInstr) \(instrument, ctx) -> do
+          outcome <- prepareInstrument orderRecord ctx instrument
+            [debit | debit <- plannedDebits, debit.instrument == instrument]
+          pure (instrument, outcome)
+        let preparedByInstrument = Map.fromList prepared
+        receiving <- forA (Map.toList ctxByInstr) \(instrument, ctx) ->
+          if fromOptional 0.0 (Map.lookup instrument plannedOutputs) > 0.0
+            then do
+              let inputAllocations = fst $ fromOptional ([], []) $
+                    Map.lookup instrument preparedByInstrument
+              allocationCid <- case inputAllocations of
+                [allocationCid] -> pure allocationCid
+                [] -> case ctx.targetAllocationCid of
+                  Some allocationCid -> pure allocationCid
+                  None -> createEmptyReceiving venue actor orderRecord ctx
+                _ -> fail "One instrument must select one allocation"
+              pure (instrument, Some allocationCid)
+            else pure (instrument, None)
+        pure Order_PrepareFunding_Result with
+          inputAllocations = Map.fromList
+            [ (instrument, allocations)
+            | (instrument, (allocations, _changeCids)) <- prepared
+            , not (null allocations)
+            ]
+          receivingAllocations = Map.fromList
+            [ (instrument, allocationCid)
+            | (instrument, Some allocationCid) <- receiving
+            ]
+          changeHoldingCids = concat
+            [ changeCids
+            | (_instrument, (_allocations, changeCids)) <- prepared
+            ]
+
+    -- | Complete the order with its outcome. Successful outcomes carry
+    -- the actual amounts and the resulting position snapshot.
+    choice Order_Complete : ContractId Result
+      with
+        outcome : Outcome
+        actualInputs : Map InstrumentId Decimal
+        actualOutputs : Map InstrumentId Decimal
+        positionSnapshot : Optional PositionSnapshot
+      controller venue, vault
+      do
+        require "A completed order must not be cancelled" $
+          outcome /= OutcomeCancelled
+        now <- getTime
+        createResult self this now outcome actualInputs actualOutputs positionSnapshot
+
+data Order_PrepareFunding_Result = Order_PrepareFunding_Result
+  with
+    inputAllocations : Map InstrumentId [ContractId AllocationV2.Allocation]
+    -- ^ Selected allocations per instrument, after funding. Settlement
+    -- must use these final IDs; funding may have archived a predecessor.
+    receivingAllocations : Map InstrumentId (ContractId AllocationV2.Allocation)
+    -- ^ Selected allocations for this order's positive output legs.
+    changeHoldingCids : [ContractId Holding]
+    -- ^ Every holding the token standard returned to the actor.
+  deriving (Eq, Show)
+
+-- | Stable result of one order. The vault signs; the actor and the venue
+-- observe. Terminal results stay available for indexing. No core
+-- contract ID or core error type appears here. Rejection text is
+-- diagnostic, not a machine-readable protocol branch.
+template Result
+  with
+    orderCid : ContractId Order
+    actor : Party
+    pool : PoolRef
+    operation : Operation
+    outcome : Outcome
+    actualInputs : Map InstrumentId Decimal
+    actualOutputs : Map InstrumentId Decimal
+    positionSnapshot : Optional PositionSnapshot
+    executedAt : Time
+  where
+    signatory pool.vault
+    observer actor, pool.venue
+
+    ensure
+      nonnegativeMap actualInputs
+      && nonnegativeMap actualOutputs
+
+    -- | Follow a deferred settlement. Only a pending result can become
+    -- settled. The choice runs inside the actual settlement transaction,
+    -- so the transition reflects real ledger settlement.
+    choice Result_MarkSettled : ContractId Result
+      -- Stored payment legs and the position snapshot cannot change.
+      controller pool.venue, pool.vault
+      do
+        require "Only a pending result can be marked settled" $
+          outcome == OutcomePendingSettlement
+        now <- getTime
+        create this with
+          outcome = OutcomeSettled
+          executedAt = now
+
+-- Static validation ---------------------------------------------------------
+
+-- | Validate the static constraints of one order specification against
+-- its pool. Order creation and the order template's ensure clause share
+-- this function, so the two cannot drift apart.
+validateOrderStatic : PoolRef -> Int -> OrderSpec -> Either Text ()
+validateOrderStatic pool tickSpacing spec = do
+  requireE "Tick spacing must be positive" $ tickSpacing > 0
+  requireE "Pool instruments must be distinct" $
+    pool.instrument1 /= pool.instrument2
+  requireE "Input instruments must be pool instruments" $
+    all (`elem` poolInstrumentsOf pool) (Map.keys spec.input.maxDebits)
+  requireE "Input maxima must be positive and within the amount bound" $
+    all validAmount (mapValues spec.input.maxDebits)
+  requireE "Explicit funding must name distinct, nonempty sources" $
+    validFunding spec.input.funding
+  requireE "Output instruments must be pool instruments" $
+    all (`elem` poolInstrumentsOf pool) (Map.keys spec.output.minOutputs)
+  requireE "Output minima must be nonnegative and within the amount bound" $
+    all (\a -> a >= 0.0 && a <= maxAmountBound) (mapValues spec.output.minOutputs)
+  case spec.operation of
+    OpSwap dir limit -> do
+      requireE "Price limit must be positive" $ limit > 0.0
+      case dir of
+        SwapExactInput instrument amount -> do
+          requireE "Swap input instrument must be a pool instrument" $
+            instrument `elem` poolInstrumentsOf pool
+          requireE "Swap input amount must be positive and within the amount bound" $
+            validAmount amount
+        SwapExactOutput instrument amount -> do
+          requireE "Swap output instrument must be a pool instrument" $
+            instrument `elem` poolInstrumentsOf pool
+          requireE "Swap output amount must be positive and within the amount bound" $
+            validAmount amount
+    OpDeposit range requestedLiquidity -> do
+      requireE "Deposit range must be valid and tick aligned" $
+        isValidRange range && aligned tickSpacing range
+      requireE "Deposit liquidity must be positive and within the amount bound" $
+        validAmount requestedLiquidity
+      requireE "Deposit output minimums must be empty" $
+        Map.null spec.output.minOutputs
+    OpWithdraw range liquidity -> do
+      requireE "Withdrawal range must be valid and tick aligned" $
+        isValidRange range && aligned tickSpacing range
+      requireE "Withdrawal liquidity must be nonnegative and within the amount bound" $
+        liquidity >= 0.0 && liquidity <= maxAmountBound
+      requireE "Withdrawal input must be empty" $ Map.null spec.input.maxDebits
+      requireE "Withdrawal funding must be standing" $
+        spec.input.funding == FundingStanding
+    OpCollect range cap1 cap2 -> do
+      requireE "Collection range must be valid and tick aligned" $
+        isValidRange range && aligned tickSpacing range
+      requireE "Collection caps must be nonnegative and within the amount bound" $
+        all (\c -> c >= 0.0 && c <= maxAmountBound) (maybeToList cap1 <> maybeToList cap2)
+      requireE "Collection input must be empty" $ Map.null spec.input.maxDebits
+      requireE "Collection funding must be standing" $
+        spec.input.funding == FundingStanding
+
+mapValues : Map k v -> [v]
+mapValues m = [v | (_k, v) <- Map.toList m]
+
+poolInstrumentsOf : PoolRef -> [InstrumentId]
+poolInstrumentsOf p = [p.instrument1, p.instrument2]
+
+-- | Explicit funding kinds need a nonempty source list. One order cannot
+-- mix source kinds because the constructor already fixes the kind.
+validFunding : Funding -> Bool
+validFunding = \case
+  FundingStanding -> True
+  FundingAllocations cids -> not (null cids) && allDistinct cids
+  FundingHoldings cids -> not (null cids) && allDistinct cids
+  FundingTransfers cids -> not (null cids) && allDistinct cids
+
+allDistinct : Ord a => [a] -> Bool
+allDistinct values = Set.size (Set.fromList values) == length values
+
+-- Source validation does not reserve or consume tokens.
+validateFundingSources : Party -> PoolRef -> Funding -> Update ()
+validateFundingSources actor pool = \case
+  FundingStanding -> pure ()
+  FundingAllocations cids -> forA_ cids \cid -> do
+    _ <- assertE =<< checkAllocation (CheckAllocArgs with
+      venue = pool.venue
+      settlementId = tcSettlementId
+      ammId = pool.ammId
+      authorizerOwner = actor
+      instrumentOpt = None
+      poolInstruments = poolInstrumentsOf pool) cid
+    pure ()
+  FundingHoldings cids -> forA_ cids \cid -> do
+    holding <- view <$> fetch @HoldingV1.Holding cid
+    require "Holding owner must be the order actor" $ holding.owner == actor
+    require "Holding instrument must be a pool instrument" $
+      holding.instrumentId `elem` poolInstrumentsOf pool
+    require "Holding amount must be positive" $ holding.amount > 0.0
+  FundingTransfers cids -> forA_ cids \cid -> do
+    instruction <- view <$> fetch @TransferInstructionV1.TransferInstruction cid
+    require "Transfer receiver must be the order actor" $
+      instruction.transfer.receiver == actor
+    require "Transfer instrument must be a pool instrument" $
+      instruction.transfer.instrumentId `elem` poolInstrumentsOf pool
+    require "Transfer amount must be positive" $ instruction.transfer.amount > 0.0
+    require "Transfer must await receiver acceptance" $
+      instruction.status == TransferInstructionV1.TransferPendingReceiverAcceptance
+
+aligned : Int -> TickRange -> Bool
+aligned spacing r =
+  spacing > 0 && (r.lower % spacing) == 0 && (r.upper % spacing) == 0
+
+nonnegativeMap : Map InstrumentId Decimal -> Bool
+nonnegativeMap = all (>= 0.0) . mapValues
+
+notExpired : Optional Time -> Time -> Bool
+notExpired expiry now = case expiry of
+  None -> True
+  Some expiry -> now <= expiry
+
+-- Use the order data already available in the consuming choice.
+createResult
+  : ContractId Order
+  -> Order
+  -> Time
+  -> Outcome
+  -> Map InstrumentId Decimal
+  -> Map InstrumentId Decimal
+  -> Optional PositionSnapshot
+  -> Update (ContractId Result)
+createResult orderCid order now outcome actualInputs actualOutputs positionSnapshot = do
+  create Result with
+    orderCid
+    actor = order.actor
+    pool = order.pool
+    operation = order.operation
+    outcome
+    actualInputs
+    actualOutputs
+    positionSnapshot
+    executedAt = now
+
+-- Preparation helpers -------------------------------------------------------
+
+-- | One instrument's share of the preparation.
+prepareInstrument
+  : Order
+  -> InstrumentContext
+  -> InstrumentId
+  -> [PlannedDebit]
+  -> Update ([ContractId AllocationV2.Allocation], [ContractId Holding])
+prepareInstrument order ctx instrument debits = do
+  validateContext order.venue order.actor order.pool.ammId (poolInstrumentsOf order.pool) ctx
+  case debits of
+    -- No debit for this instrument: the context only supplies a receiving
+    -- allocation.
+    [] -> pure ([], [])
+    _ -> do
+      require "One instrument must have exactly one planned debit" $
+        length debits == 1
+      let debit = case debits of
+            (d :: _) -> d
+            [] -> error "unreachable"
+      require "Debit instrument must match the context" $
+        debit.instrument == instrument
+      case debit.source of
+        DebitStanding allocationCid -> do
+          selected <- requireSome "Standing debit requires a selected target allocation" ctx.targetAllocationCid
+          require "Standing debit must use the context's selected allocation" $
+            selected == allocationCid
+          requireAllocationFunding order ctx debit.amount allocationCid
+          pure ([allocationCid], [])
+        DebitAllocations allocationCids -> case allocationCids of
+          [allocationCid] -> do
+            requireAllocationFunding order ctx debit.amount allocationCid
+            pure ([allocationCid], [])
+          _ -> fail "One instrument must select one embedded allocation"
+        DebitHoldings holdingCids -> do
+          forA_ holdingCids \holdingCid -> do
+            holding <- view <$> fetch @HoldingV1.Holding holdingCid
+            require "Holding owner must be the order actor" $
+              holding.owner == order.actor
+            require "Holding instrument must match the planned debit" $
+              holding.instrumentId == instrument
+          outcome <- prepareDebit order.venue order.actor order.pool.ammId
+            (poolInstrumentsOf order.pool) ctx debit.amount (map coerceContractId holdingCids)
+          pure ([outcome.allocationCid], outcome.changeHoldingCids)
+        DebitTransfer instructionCids -> do
+          holdingCids <- concat <$> forA instructionCids (acceptTransferInstruction order.actor ctx)
+          outcome <- prepareDebit order.venue order.actor order.pool.ammId (poolInstrumentsOf order.pool) ctx debit.amount holdingCids
+          pure ([outcome.allocationCid], outcome.changeHoldingCids)
+
+requireAllocationFunding
+  : Order -> InstrumentContext -> Decimal -> ContractId AllocationV2.Allocation -> Update ()
+requireAllocationFunding order ctx amount allocationCid = do
+  checked <- assertE =<< checkAllocation (embeddedCheckArgs order ctx) allocationCid
+  require "Selected allocation must use the context account" $
+    checked.authorizer == ctx.account
+  require "Selected allocation must cover the planned debit" $
+    fromOptional 0.0 (TextMap.lookup ctx.instrument.id checked.nextIterationFunding) >= amount
+
+-- | Validation arguments for an embedded allocation of this order.
+embeddedCheckArgs : Order -> InstrumentContext -> CheckAllocArgs
+embeddedCheckArgs order ctx = CheckAllocArgs with
+  venue = order.venue
+  settlementId = tcSettlementId
+  ammId = order.pool.ammId
+  authorizerOwner = order.actor
+  instrumentOpt = Some ctx.instrument
+  poolInstruments = poolInstrumentsOf order.pool
+
+-- | Validate one planned debit against the order's stored input limits.
+validateDebit : Order -> PlannedDebit -> Update ()
+validateDebit order debit = do
+  require "Planned debit must be positive" $ debit.amount > 0.0
+  maximumDebit <- requireSome "Planned debit has no input maximum" $
+    Map.lookup debit.instrument order.input.maxDebits
+  require "Planned debit must not exceed the input maximum" $
+    debit.amount <= maximumDebit
+  let sourceMatches = case (order.input.funding, debit.source) of
+        (FundingStanding, DebitStanding _) -> True
+        (FundingAllocations signed, DebitAllocations supplied) -> signedSources signed supplied
+        (FundingHoldings signed, DebitHoldings supplied) -> signedSources signed supplied
+        (FundingTransfers signed, DebitTransfer supplied) -> signedSources signed supplied
+        _ -> False
+  require "Debit sources must come from the order's signed funding" sourceMatches
+
+signedSources : Ord a => [a] -> [a] -> Bool
+signedSources signed supplied =
+  let authorized = Set.fromList signed
+  in not (null supplied) && allDistinct supplied
+    && all (`Set.member` authorized) supplied
+
+-- The caller supplies actual output legs, not a predicted full fill.
+validatePreparedOutputs : Order -> Map InstrumentId Decimal -> Update ()
+validatePreparedOutputs order outputs = do
+  require "Prepared outputs must name pool instruments" $
+    all (`elem` poolInstrumentsOf order.pool) (Map.keys outputs)
+  require "Prepared outputs must be nonnegative and within the amount bound" $
+    all (\amount -> amount >= 0.0 && amount <= maxAmountBound) (mapValues outputs)
+  require "Prepared outputs must satisfy the order's minimums" $
+    all (\(instrument, minimum) -> fromOptional 0.0 (Map.lookup instrument outputs) >= minimum)
+      (Map.toList order.output.minOutputs)
+  let allowed = case order.operation of
+        OpSwap (SwapExactInput instrument _) _ ->
+          [i | i <- poolInstrumentsOf order.pool, i /= instrument]
+        OpSwap (SwapExactOutput instrument _) _ -> [instrument]
+        OpDeposit _ _ -> []
+        OpWithdraw _ liquidity ->
+          if liquidity > 0.0 then poolInstrumentsOf order.pool else []
+        OpCollect _ _ _ -> poolInstrumentsOf order.pool
+  require "Prepared output instrument must match the operation" $
+    all (\(instrument, amount) -> amount == 0.0 || instrument `elem` allowed) (Map.toList outputs)
+  case order.operation of
+    OpCollect _ cap1 cap2 -> do
+      forA_ [(order.pool.instrument1, cap1), (order.pool.instrument2, cap2)] \(instrument, cap) ->
+        case cap of
+          None -> pure ()
+          Some maximum -> require "Prepared collection must not exceed its cap" $
+            fromOptional 0.0 (Map.lookup instrument outputs) <= maximum
+    _ -> pure ()
+
+maybeToList : Optional a -> [a]
+maybeToList = \case
+  Some a -> [a]
+  None -> []
+
+createEmptyReceiving : Party -> Party -> Order -> InstrumentContext -> Update (ContractId AllocationV2.Allocation)
+createEmptyReceiving venue actor order ctx = do
+  validateContext venue actor order.pool.ammId (poolInstrumentsOf order.pool) ctx
+  (allocationCid, _changeCids) <- createSettlementAllocation $
+    CreateSettlementAllocationArgs with
+      ammId = order.pool.ammId
+      instruments = poolInstrumentsOf order.pool
+      venue
+      allocationActor = actor
+      instrument = ctx.instrument
+      authorizerAccount = ctx.account
+      initialFunding = None
+      inputHoldingCids = []
+      allocationFactoryCid = ctx.allocationFactoryCid
+      extraArgs = ctx.allocationExtraArgs
+  pure allocationCid

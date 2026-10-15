@@ -1,0 +1,213 @@
+-- Stable data types for the Tradecraft V7 partner order API.
+--
+-- This module holds only serializable data and pure helpers. It imports
+-- Token Standard interface types, never Tradecraft core types and no
+-- template definitions. Every other module of this package builds on it.
+
+module TC.OrderV2.Types
+  ( PoolRef(..)
+  , TickRange(..)
+  , isValidRange
+  , SwapDirection(..)
+  , Operation(..)
+  , Funding(..)
+  , Input(..)
+  , Output(..)
+  , OrderSpec(..)
+  , Outcome(..)
+  , PositionSnapshot(..)
+  , InstrumentContext(..)
+  , PlannedDebit(..)
+  , DebitSource(..)
+  , maxAmountBound
+  , validAmount
+  ) where
+
+import DA.Map (Map)
+
+import Splice.Api.Token.AllocationInstructionV2 (AllocationFactory)
+import Splice.Api.Token.AllocationV2 (Allocation, SettlementFactory)
+import Splice.Api.Token.HoldingV1 (Holding, InstrumentId(..))
+import Splice.Api.Token.HoldingV2 (Account)
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
+import Splice.Api.Token.TransferInstructionV1 (TransferInstruction)
+
+-- | Stable identity of one V7 pool. Instrument order is canonical and set
+-- at pool creation.
+data PoolRef = PoolRef
+  with
+    venue : Party
+    vault : Party
+    ammId : Text
+    instrument1 : InstrumentId
+    instrument2 : InstrumentId
+  deriving (Eq, Ord, Show)
+
+-- | Half-open tick range. The lower bound is inclusive, the upper bound
+-- is exclusive.
+data TickRange = TickRange
+  with
+    lower : Int
+    upper : Int
+  deriving (Eq, Ord, Show)
+
+-- | Freeze the V6 tick domain without importing the core math package.
+isValidRange : TickRange -> Bool
+isValidRange r =
+  r.lower < r.upper && -230270 <= r.lower && r.upper <= 230270
+
+-- | One swap leg. Exact input spends the given amount; exact output
+-- receives the given amount. Partial fills at the price limit are possible
+-- for both directions.
+data SwapDirection
+  = SwapExactInput
+    with
+      inputInstrument : InstrumentId
+      inputAmount : Decimal
+  | SwapExactOutput
+    with
+      outputInstrument : InstrumentId
+      outputAmount : Decimal
+  deriving (Eq, Ord, Show)
+
+-- | The four V7 operations. Prices and fee-growth values use Numeric 20;
+-- token and liquidity amounts use Decimal.
+data Operation
+  = OpSwap
+    with
+      direction : SwapDirection
+      sqrtPriceLimit : Numeric 20
+  | OpDeposit
+    with
+      range : TickRange
+      requestedLiquidity : Decimal
+  | OpWithdraw
+    with
+      range : TickRange
+      liquidity : Decimal
+      -- ^ Zero selects the fee-refresh operation.
+  | OpCollect
+    with
+      range : TickRange
+      cap1 : Optional Decimal
+      cap2 : Optional Decimal
+      -- ^ Optional per-instrument caps on the collected amounts.
+  deriving (Eq, Ord, Show)
+
+-- | The funding source selected at order creation.
+--
+-- The three explicit kinds each require a nonempty list. One order must
+-- not mix source kinds.
+data Funding
+  = FundingStanding
+    -- ^ Use the actor's standing settlement allocations.
+  | FundingAllocations
+    with
+      allocationCids : [ContractId Allocation]
+      -- ^ Embedded committed V2 allocations.
+  | FundingHoldings
+    with
+      holdingCids : [ContractId Holding]
+  | FundingTransfers
+    with
+      instructionCids : [ContractId TransferInstruction]
+  deriving (Eq, Ord, Show)
+
+-- | Per-instrument maximum debit amounts. A maximum is a limit, not proof
+-- of available funds; execution must fund the actual debit.
+data Input = Input
+  with
+    maxDebits : Map InstrumentId Decimal
+    funding : Funding
+  deriving (Eq, Ord, Show)
+
+-- | Per-instrument minimum output amounts. The actor is the receiver.
+data Output = Output
+  with
+    minOutputs : Map InstrumentId Decimal
+  deriving (Eq, Ord, Show)
+
+-- | One requested operation with its limits.
+data OrderSpec = OrderSpec
+  with
+    operation : Operation
+    input : Input
+    output : Output
+    expiresAt : Optional Time
+  deriving (Eq, Ord, Show)
+
+-- | Terminal or transitional outcome of one order.
+data Outcome
+  = OutcomeCancelled
+  | OutcomeRejected Text
+    -- ^ Diagnostic text, not a machine-readable protocol branch.
+  | OutcomePendingSettlement
+  | OutcomeSettled
+  deriving (Eq, Ord, Show)
+
+-- | Stable snapshot of one position after an operation. Prices, fee
+-- growth, and owed amounts use Numeric 20; token and liquidity amounts
+-- use Decimal.
+data PositionSnapshot = PositionSnapshot
+  with
+    owner : Party
+    ammId : Text
+    range : TickRange
+    liquidity : Decimal
+    feeGrowthInside1Last : Numeric 20
+    feeGrowthInside2Last : Numeric 20
+    tokensOwed1 : Numeric 20
+    tokensOwed2 : Numeric 20
+  deriving (Eq, Ord, Show)
+
+-- | Token Standard context for one instrument, supplied per preparation.
+data InstrumentContext = InstrumentContext
+  with
+    instrument : InstrumentId
+    account : Account
+    -- ^ The actor's holding account.
+    targetAllocationCid : Optional (ContractId Allocation)
+    -- ^ Selected standing allocation; None lets preparation create one.
+    allocationFactoryCid : ContractId AllocationFactory
+    allocationExtraArgs : ExtraArgs
+    settlementFactoryCid : ContractId SettlementFactory
+    settlementExtraArgs : ExtraArgs
+    transferAcceptExtraArgs : Map (ContractId TransferInstruction) ExtraArgs
+    -- ^ Accept arguments per pending transfer instruction.
+  deriving (Eq, Show)
+
+-- | One planned debit leg. The executor derives this from the order and
+-- its math; preparation checks it against the order's stored limits.
+data PlannedDebit = PlannedDebit
+  with
+    instrument : InstrumentId
+    amount : Decimal
+    source : DebitSource
+  deriving (Eq, Ord, Show)
+
+-- | Where one planned debit draws its funds.
+data DebitSource
+  = DebitStanding
+    with
+      allocationCid : ContractId Allocation
+    -- ^ The actor's standing allocation named in the context.
+  | DebitAllocations
+    with
+      allocationCids : [ContractId Allocation]
+    -- ^ Embedded committed allocations owned by the actor.
+  | DebitHoldings
+    with
+      holdingCids : [ContractId Holding]
+  | DebitTransfer
+    with
+      instructionCids : [ContractId TransferInstruction]
+  deriving (Eq, Ord, Show)
+
+-- | Absolute bound for token and liquidity amounts. Larger values cannot
+-- be represented safely by the pool math's Numeric 20 casts.
+maxAmountBound : Decimal
+maxAmountBound = 1.0e17
+
+-- | A token or liquidity amount must be within the pool amount bound.
+validAmount : Decimal -> Bool
+validAmount a = a > 0.0 && a <= maxAmountBound
