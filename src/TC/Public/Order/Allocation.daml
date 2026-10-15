@@ -1,11 +1,7 @@
--- Stable allocation helpers for the Tradecraft V7 partner order API.
---
--- This module validates and manages Token Standard V2 settlement
--- allocations for Tradecraft pools. It is a frozen copy of the token-only
--- core logic. It depends only on the standard library and the pinned
--- Token Standard packages, never on Tradecraft core.
+-- Token Standard settlement allocation checks and funding operations.
+-- This module has no Tradecraft core dependency.
 
-module TC.OrderV2.Allocation
+module TC.Public.Order.Allocation
   ( tcSettlementId
   , ammIdMetadataKey
   , instrumentIdMetadataKey
@@ -42,9 +38,8 @@ import Splice.Api.Token.HoldingV2 qualified as HoldingV2
 import Splice.Api.Token.MetadataV1 (ExtraArgs(..), Metadata(..), emptyMetadata)
 import Splice.Api.Token.TransferInstructionV1 qualified as TransferInstructionV1
 
-import TC.OrderV2.Types (InstrumentContext(..))
+import TC.Public.Order.Types (InstrumentContext(..))
 
--- Local assertion helpers. The stable package does not import core helpers.
 require : Text -> Bool -> Update ()
 require msg cond = if cond then pure () else fail msg
 

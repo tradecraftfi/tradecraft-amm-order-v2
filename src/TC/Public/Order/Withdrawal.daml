@@ -1,13 +1,8 @@
--- Stable withdrawal requests for V7 settlement allocations.
---
--- A partner requests release of unused allocation funds through this
--- template without exercising any core template. The actor signs and may
--- cancel. The venue may reject or fulfill. Fulfillment cancels the
--- supplied allocations and returns the released holdings. The off-ledger
--- worker fulfills a request only after it confirms that the actor and
--- pool have no unsettled V7 debits.
+-- Partners request release without exercising a core template.
+-- The worker must confirm that the actor and pool have no unsettled debits
+-- before it fulfills a request.
 
-module TC.OrderV2.Withdrawal
+module TC.Public.Order.Withdrawal
   ( WithdrawalRequest(..)
   , WithdrawalRequest_Cancel(..)
   , WithdrawalRequest_Reject(..)
@@ -27,7 +22,7 @@ import Splice.Api.Token.HoldingV2 qualified as HoldingV2
 import Splice.Api.Token.MetadataV1 (ExtraArgs)
 import Splice.TokenStandard.Utils qualified as TokenStandard
 
-import TC.OrderV2.Allocation
+import TC.Public.Order.Allocation
   ( CheckAllocArgs(..)
   , checkAllocation
   , tcSettlementId
@@ -50,7 +45,6 @@ template WithdrawalRequest
     signatory actor
     observer venue
 
-    -- | The actor cancels the request.
     choice WithdrawalRequest_Cancel : ()
       controller actor
       do pure ()
@@ -63,7 +57,6 @@ template WithdrawalRequest
       controller venue
       do pure ()
 
-    -- | The venue releases the named allocations back to the actor.
     choice WithdrawalRequest_Fulfill : WithdrawalRequest_Fulfill_Result
       with
         allocations : [(ContractId AllocationV2.Allocation, ExtraArgs)]
@@ -115,7 +108,6 @@ data WithdrawalRequest_Fulfill_Result = WithdrawalRequest_Fulfill_Result
     releasedHoldingCids : [ContractId HoldingV2.Holding]
   deriving (Eq, Show)
 
--- Local assertion helpers. The stable package does not import core helpers.
 require : Text -> Bool -> Update ()
 require msg cond = if cond then pure () else fail msg
 

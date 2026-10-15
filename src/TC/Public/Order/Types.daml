@@ -1,10 +1,6 @@
--- Stable data types for the Tradecraft V7 partner order API.
---
--- This module holds only serializable data and pure helpers. It imports
--- Token Standard interface types, never Tradecraft core types and no
--- template definitions. Every other module of this package builds on it.
+-- Serializable order data and pure validation without Tradecraft core types.
 
-module TC.OrderV2.Types
+module TC.Public.Order.Types
   ( PoolRef(..)
   , TickRange(..)
   , isValidRange
@@ -32,8 +28,7 @@ import Splice.Api.Token.HoldingV2 (Account)
 import Splice.Api.Token.MetadataV1 (ExtraArgs)
 import Splice.Api.Token.TransferInstructionV1 (TransferInstruction)
 
--- | Stable identity of one V7 pool. Instrument order is canonical and set
--- at pool creation.
+-- | Instrument order is canonical and set at pool creation.
 data PoolRef = PoolRef
   with
     venue : Party
@@ -51,7 +46,7 @@ data TickRange = TickRange
     upper : Int
   deriving (Eq, Ord, Show)
 
--- | Freeze the V6 tick domain without importing the core math package.
+-- | Match the V6 tick domain without importing core math.
 isValidRange : TickRange -> Bool
 isValidRange r =
   r.lower < r.upper && -230270 <= r.lower && r.upper <= 230270
@@ -145,9 +140,8 @@ data Outcome
   | OutcomeSettled
   deriving (Eq, Ord, Show)
 
--- | Stable snapshot of one position after an operation. Prices, fee
--- growth, and owed amounts use Numeric 20; token and liquidity amounts
--- use Decimal.
+-- | Prices, fee growth, and owed amounts use Numeric 20; token and
+-- liquidity amounts use Decimal.
 data PositionSnapshot = PositionSnapshot
   with
     owner : Party

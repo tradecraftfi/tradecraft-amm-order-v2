@@ -1,20 +1,14 @@
-# Stable partner order API for Tradecraft V7 pools.
-#
-# This package is a frozen contract API. A dependency or compiler change
-# here is an explicit stable API release. It must never depend on the
-# Tradecraft core package.
+# Partner order contracts must not depend on the Tradecraft core.
 sdk-version: 3.5.1
 name: tradecraft-amm-order-v2
 source: src
-version: 2.0.0
+version: 2.1.0
 build-options:
   - --target=2.3
   - -Wupgrade-interfaces
 dependencies:
   - daml-prim
   - daml-stdlib
-#upgrades:
-#  /path/to/old.dar
 data-dependencies:
   # Splice Token Standard 0.8.1 release bundle, versioned DARs.
   # Do not replace these with -current aliases.

@@ -1,12 +1,7 @@
--- Stable positions for Tradecraft V7 pools.
---
--- The position contract lives in this stable package so a partner can
--- observe its own positions without the Tradecraft core package. The
--- vault is the signatory; the venue and the owner are observers. The
--- engine replaces and archives positions through the vault-controlled
--- choices.
+-- Partners can read their positions without the Tradecraft core package.
+-- The venue and vault control replacement; the owner cannot change the state.
 
-module TC.OrderV2.Position
+module TC.Public.Order.Position
   ( Position(..)
   , PositionKey(..)
   , Position_Replace(..)
@@ -16,7 +11,7 @@ module TC.OrderV2.Position
 import DA.Numeric (RoundingMode (..), castAndRound, roundNumeric)
 
 import Splice.Api.Token.HoldingV1 (InstrumentId)
-import TC.OrderV2.Types (TickRange (..), isValidRange)
+import TC.Public.Order.Types (TickRange (..), isValidRange)
 
 -- | Complete identity of one live position. The protocol expects at most
 -- one live position per key.
@@ -95,6 +90,5 @@ isSpent liquidity owed1 owed2 =
 downToPayment : Numeric 20 -> Decimal
 downToPayment = castAndRound . roundNumeric 10 RoundingDown
 
--- Local helper.
 require : Text -> Bool -> Update ()
 require msg cond = if cond then pure () else fail msg

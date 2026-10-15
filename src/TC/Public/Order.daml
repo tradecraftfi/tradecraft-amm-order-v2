@@ -1,11 +1,7 @@
--- Stable factory, order, and result contracts for Tradecraft V7 pools.
---
--- Partners create, cancel, and observe orders, and read results, with
--- only this package and their Token Standard packages. The venue and the
--- vault prepare funding and complete execution. This module never calls
--- Tradecraft core code and does not recalculate the AMM price.
+-- Partners create, cancel, and read orders without the Tradecraft core.
+-- This package uses Token Standard interfaces and does not calculate prices.
 
-module TC.OrderV2
+module TC.Public.Order
   ( Factory(..)
   , Factory_CreateOrders(..)
   , Factory_CreateOrders_Result(..)
@@ -38,7 +34,7 @@ import Splice.Api.Token.HoldingV1 qualified as HoldingV1
 import Splice.Api.Token.HoldingV2 (Holding)
 import Splice.Api.Token.TransferInstructionV1 qualified as TransferInstructionV1
 
-import TC.OrderV2.Allocation
+import TC.Public.Order.Allocation
   ( CheckAllocArgs(..)
   , CreateSettlementAllocationArgs(..)
   , FundSettlementAllocationArgs(..)
@@ -54,12 +50,10 @@ import TC.OrderV2.Allocation
   , requireSome
   , validateContext
   )
-import TC.OrderV2.Types
+import TC.Public.Order.Types
 
--- | Stable, immutable description of one V7 pool. The core's venue
--- controlled pool creation choice creates the factory. Partners receive
--- its disclosure; they never submit a command against the core pool
--- rules.
+-- | Partners submit through this disclosed factory, not the core pool rules.
+-- Its venue and vault signatories authorize order creation.
 template Factory
   with
     venue : Party
@@ -291,9 +285,7 @@ data Order_PrepareFunding_Result = Order_PrepareFunding_Result
     -- ^ Every holding the token standard returned to the actor.
   deriving (Eq, Show)
 
--- | Stable result of one order. The vault signs; the actor and the venue
--- observe. Terminal results stay available for indexing. No core
--- contract ID or core error type appears here. Rejection text is
+-- | Terminal results remain available for indexing. Rejection text is
 -- diagnostic, not a machine-readable protocol branch.
 template Result
   with
@@ -327,8 +319,6 @@ template Result
         create this with
           outcome = OutcomeSettled
           executedAt = now
-
--- Static validation ---------------------------------------------------------
 
 -- | Validate the static constraints of one order specification against
 -- its pool. Order creation and the order template's ensure clause share
@@ -466,8 +456,6 @@ createResult orderCid order now outcome actualInputs actualOutputs positionSnaps
     actualOutputs
     positionSnapshot
     executedAt = now
-
--- Preparation helpers -------------------------------------------------------
 
 -- | One instrument's share of the preparation.
 prepareInstrument
