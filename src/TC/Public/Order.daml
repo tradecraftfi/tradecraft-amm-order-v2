@@ -82,6 +82,7 @@ template Factory
         now <- getTime
         forA_ specs \spec -> do
           assertE $ validateOrderStatic pool tickSpacing spec
+          require "Order must not be expired" $ notExpired spec.expiresAt now
           validateFundingSources actor pool spec.input.funding
         orderCids <- forA specs \spec ->
           create Order with
@@ -217,7 +218,7 @@ template Order
         require "Planned debits must name distinct instruments" $
           allDistinct (map (.instrument) plannedDebits)
         forA_ plannedDebits \debit -> validateDebit orderRecord debit
-        validatePreparedOutputs orderRecord plannedOutputs
+        validateOutputs orderRecord plannedOutputs
         let ctxByInstr = Map.fromList [(ctx.instrument, ctx) | ctx <- contexts]
             requiredInstruments =
               map (.instrument) plannedDebits
@@ -259,8 +260,8 @@ template Order
             | (_instrument, (_allocations, changeCids)) <- prepared
             ]
 
-    -- | Complete the order with its outcome. Successful outcomes carry
-    -- the actual amounts and the resulting position snapshot.
+    -- | Complete the order with its actual amounts and position snapshot.
+    -- Successful partial fills must still satisfy the actor's signed limits.
     choice Order_Complete : ContractId Result
       with
         outcome : Outcome
@@ -271,6 +272,20 @@ template Order
       do
         require "A completed order must not be cancelled" $
           outcome /= OutcomeCancelled
+        case outcome of
+          OutcomeRejected _ ->
+            require "Rejected orders must not record payment legs" $
+              all (== 0.0) (mapValues actualInputs)
+                && all (== 0.0) (mapValues actualOutputs)
+          _ -> do
+            require "Actual inputs must name pool instruments" $
+              all (`elem` poolInstrumentsOf pool) (Map.keys actualInputs)
+            require "Actual inputs must be nonnegative and within the signed maxima" $
+              all (\(instrument, amount) ->
+                amount >= 0.0
+                  && amount <= fromOptional 0.0 (Map.lookup instrument input.maxDebits))
+                (Map.toList actualInputs)
+            validateOutputs this actualOutputs
         now <- getTime
         createResult self this now outcome actualInputs actualOutputs positionSnapshot
 
@@ -546,14 +561,14 @@ signedSources signed supplied =
   in not (null supplied) && allDistinct supplied
     && all (`Set.member` authorized) supplied
 
--- The caller supplies actual output legs, not a predicted full fill.
-validatePreparedOutputs : Order -> Map InstrumentId Decimal -> Update ()
-validatePreparedOutputs order outputs = do
-  require "Prepared outputs must name pool instruments" $
+-- Supplied legs can describe a partial fill. Explicit minima still apply.
+validateOutputs : Order -> Map InstrumentId Decimal -> Update ()
+validateOutputs order outputs = do
+  require "Outputs must name pool instruments" $
     all (`elem` poolInstrumentsOf order.pool) (Map.keys outputs)
-  require "Prepared outputs must be nonnegative and within the amount bound" $
+  require "Outputs must be nonnegative and within the amount bound" $
     all (\amount -> amount >= 0.0 && amount <= maxAmountBound) (mapValues outputs)
-  require "Prepared outputs must satisfy the order's minimums" $
+  require "Outputs must satisfy the order's minimums" $
     all (\(instrument, minimum) -> fromOptional 0.0 (Map.lookup instrument outputs) >= minimum)
       (Map.toList order.output.minOutputs)
   let allowed = case order.operation of
@@ -564,14 +579,14 @@ validatePreparedOutputs order outputs = do
         OpWithdraw _ liquidity ->
           if liquidity > 0.0 then poolInstrumentsOf order.pool else []
         OpCollect _ _ _ -> poolInstrumentsOf order.pool
-  require "Prepared output instrument must match the operation" $
+  require "Output instrument must match the operation" $
     all (\(instrument, amount) -> amount == 0.0 || instrument `elem` allowed) (Map.toList outputs)
   case order.operation of
     OpCollect _ cap1 cap2 -> do
       forA_ [(order.pool.instrument1, cap1), (order.pool.instrument2, cap2)] \(instrument, cap) ->
         case cap of
           None -> pure ()
-          Some maximum -> require "Prepared collection must not exceed its cap" $
+          Some maximum -> require "Collection must not exceed its cap" $
             fromOptional 0.0 (Map.lookup instrument outputs) <= maximum
     _ -> pure ()
 

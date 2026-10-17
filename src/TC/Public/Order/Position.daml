@@ -79,9 +79,9 @@ template Position
             tokensOwed2
 
 -- | A position is spent when it holds no liquidity and each owed amount
--- rounds down to zero at the payment scale. Owed amounts keep full
--- Numeric 20 precision; fractions below one payment unit stay claimable
--- until later accrual.
+-- rounds down to zero at the payment scale. Sub-unit fractions retain
+-- Numeric 20 precision while the position stays live. A spent replacement
+-- drops those fractions and creates no successor.
 isSpent : Decimal -> Numeric 20 -> Numeric 20 -> Bool
 isSpent liquidity owed1 owed2 =
   liquidity == 0.0 && downToPayment owed1 == 0.0 && downToPayment owed2 == 0.0
