@@ -24,7 +24,7 @@ module TC.Public.Order
 import DA.Foldable (forA_)
 import DA.Map (Map)
 import DA.Map qualified as Map
-import DA.Optional (fromOptional)
+import DA.Optional (fromOptional, isSome)
 import DA.Set qualified as Set
 import DA.TextMap qualified as TextMap
 
@@ -43,6 +43,7 @@ import TC.Public.Order.Allocation
   , checkAllocation
   , createSettlementAllocation
   , fundSettlementAllocation
+  , fundVaultDebit
   , prepareDebit
   , require
   , requireE
@@ -205,6 +206,11 @@ template Order
     -- accepts pending transfers, allocates holdings, and returns the
     -- selected allocation IDs and every change holding. It fetches no
     -- core contract.
+    --
+    -- Contexts are selected by owning party and instrument. Transfers
+    -- addressed to the vault fund a vault-owned allocation directly and
+    -- return any surplus to the actor; every other source funds through
+    -- the actor's context as before.
     nonconsuming choice Order_PrepareFunding : Order_PrepareFunding_Result
       with
         plannedDebits : [PlannedDebit]
@@ -219,36 +225,79 @@ template Order
           allDistinct (map (.instrument) plannedDebits)
         forA_ plannedDebits \debit -> validateDebit orderRecord debit
         validateOutputs orderRecord plannedOutputs
-        let ctxByInstr = Map.fromList [(ctx.instrument, ctx) | ctx <- contexts]
-            requiredInstruments =
-              map (.instrument) plannedDebits
-                <> [instrument | (instrument, amount) <- Map.toList plannedOutputs, amount > 0.0]
-        require "Contexts must name distinct instruments" $
-          Map.size ctxByInstr == length contexts
-        require "Each payment instrument needs a preparation context" $
-          all (`Map.member` ctxByInstr) requiredInstruments
-        prepared <- forA (Map.toList ctxByInstr) \(instrument, ctx) -> do
-          outcome <- prepareInstrument orderRecord ctx instrument
-            [debit | debit <- plannedDebits, debit.instrument == instrument]
-          pure (instrument, outcome)
-        let preparedByInstrument = Map.fromList prepared
-        receiving <- forA (Map.toList ctxByInstr) \(instrument, ctx) ->
-          if fromOptional 0.0 (Map.lookup instrument plannedOutputs) > 0.0
-            then do
-              let inputAllocations = fst $ fromOptional ([], []) $
-                    Map.lookup instrument preparedByInstrument
-              allocationCid <- case inputAllocations of
-                [allocationCid] -> pure allocationCid
-                [] -> case ctx.targetAllocationCid of
-                  Some allocationCid -> pure allocationCid
-                  None -> createEmptyReceiving venue actor orderRecord ctx
-                _ -> fail "One instrument must select one allocation"
-              pure (instrument, Some allocationCid)
-            else pure (instrument, None)
+        require "Context accounts must have an owner" $
+          all (\ctx -> isSome ctx.account.owner) contexts
+        let allowsVaultContext = case orderRecord.input.funding of
+              FundingTransfersToVault _ -> True
+              _ -> False
+        require "Contexts must belong to the order actor or the vault" $
+          all (\ctx -> case ctx.account.owner of
+            Some owner -> owner == orderRecord.actor
+              || (allowsVaultContext && owner == orderRecord.vault)
+            None -> False) contexts
+        let ctxByPair = Map.fromList
+              [ ((owner, ctx.instrument), ctx)
+              | ctx <- contexts
+              , Some owner <- [ctx.account.owner]
+              ]
+            actorPair instrument = (orderRecord.actor, instrument)
+            debitOwner source = case source of
+              DebitTransferToVault _ -> orderRecord.vault
+              _ -> orderRecord.actor
+            requiredPairs =
+              [ (debitOwner debit.source, debit.instrument)
+              | debit <- plannedDebits
+              ]
+              <> [ actorPair instrument
+                 | (instrument, amount) <- Map.toList plannedOutputs
+                 , amount > 0.0
+                 ]
+        require "Contexts must name distinct owners and instruments" $
+          Map.size ctxByPair == length contexts
+        require "Each debit and positive output needs its owner's context" $
+          all (`Map.member` ctxByPair) requiredPairs
+        prepared <- forA (Map.toList ctxByPair) \((owner, instrument), ctx) -> do
+          let debits = [debit | debit <- plannedDebits,
+                               debit.instrument == instrument,
+                               debitOwner debit.source == owner]
+          outcome <- case debits of
+            [] -> do
+              validateContext venue owner orderRecord.pool.ammId
+                (poolInstrumentsOf orderRecord.pool) ctx
+              pure ([], [])
+            [debit] -> case debit.source of
+              DebitTransferToVault offers -> do
+                funded <- fundVaultDebit
+                  venue actor vault orderRecord.pool.ammId
+                  (poolInstrumentsOf orderRecord.pool)
+                  ctx (Map.lookup (actorPair instrument) ctxByPair)
+                  debit.amount offers
+                pure ([funded.allocationCid], funded.changeHoldingCids)
+              _ -> prepareInstrument orderRecord ctx instrument debits
+            _ -> fail "One instrument must have one planned debit"
+          pure ((owner, instrument), outcome)
+        let preparedByPair = Map.fromList prepared
+        -- Positive outputs always receive through an actor-owned
+        -- context; vault funding never supplies a receiver here.
+        receiving <- forA
+          [pair | pair@((owner, _), _) <- Map.toList ctxByPair, owner == orderRecord.actor]
+          \((_, instrument), ctx) ->
+            if fromOptional 0.0 (Map.lookup instrument plannedOutputs) > 0.0
+              then do
+                let inputAllocations = fst $ fromOptional ([], []) $
+                      Map.lookup (orderRecord.actor, instrument) preparedByPair
+                allocationCid <- case inputAllocations of
+                  [allocationCid] -> pure allocationCid
+                  [] -> case ctx.targetAllocationCid of
+                    Some allocationCid -> pure allocationCid
+                    None -> createEmptyReceiving venue actor orderRecord ctx
+                  _ -> fail "One instrument must select one allocation"
+                pure (instrument, Some allocationCid)
+              else pure (instrument, None)
         pure Order_PrepareFunding_Result with
           inputAllocations = Map.fromList
             [ (instrument, allocations)
-            | (instrument, (allocations, _changeCids)) <- prepared
+            | ((_, instrument), (allocations, _)) <- prepared
             , not (null allocations)
             ]
           receivingAllocations = Map.fromList
@@ -257,7 +306,7 @@ template Order
             ]
           changeHoldingCids = concat
             [ changeCids
-            | (_instrument, (_allocations, changeCids)) <- prepared
+            | (_, (_, changeCids)) <- prepared
             ]
 
     -- | Complete the order with its actual amounts and position snapshot.
@@ -297,7 +346,8 @@ data Order_PrepareFunding_Result = Order_PrepareFunding_Result
     receivingAllocations : Map InstrumentId (ContractId AllocationV2.Allocation)
     -- ^ Selected allocations for this order's positive output legs.
     changeHoldingCids : [ContractId Holding]
-    -- ^ Every holding the token standard returned to the actor.
+    -- ^ Every holding the token standard returned to the actor,
+    --   including the refund of overfunded direct vault funding.
   deriving (Eq, Show)
 
 -- | Terminal results remain available for indexing. Rejection text is
@@ -404,7 +454,8 @@ validFunding = \case
   FundingStanding -> True
   FundingAllocations cids -> not (null cids) && allDistinct cids
   FundingHoldings cids -> not (null cids) && allDistinct cids
-  FundingTransfers cids -> not (null cids) && allDistinct cids
+  FundingTransfersToActor cids -> not (null cids) && allDistinct cids
+  FundingTransfersToVault cids -> not (null cids) && allDistinct cids
 
 allDistinct : Ord a => [a] -> Bool
 allDistinct values = Set.size (Set.fromList values) == length values
@@ -428,7 +479,7 @@ validateFundingSources actor pool = \case
     require "Holding instrument must be a pool instrument" $
       holding.instrumentId `elem` poolInstrumentsOf pool
     require "Holding amount must be positive" $ holding.amount > 0.0
-  FundingTransfers cids -> forA_ cids \cid -> do
+  FundingTransfersToActor cids -> forA_ cids \cid -> do
     instruction <- view <$> fetch @TransferInstructionV1.TransferInstruction cid
     require "Transfer receiver must be the order actor" $
       instruction.transfer.receiver == actor
@@ -437,6 +488,19 @@ validateFundingSources actor pool = \case
     require "Transfer amount must be positive" $ instruction.transfer.amount > 0.0
     require "Transfer must await receiver acceptance" $
       instruction.status == TransferInstructionV1.TransferPendingReceiverAcceptance
+  FundingTransfersToVault cids -> do
+    require "Direct funding actor must differ from the vault" $ actor /= pool.vault
+    forA_ cids \cid -> do
+      instruction <- view <$> fetch @TransferInstructionV1.TransferInstruction cid
+      require "Transfer sender must be the order actor" $
+        instruction.transfer.sender == actor
+      require "Transfer receiver must be the pool vault" $
+        instruction.transfer.receiver == pool.vault
+      require "Transfer instrument must be a pool instrument" $
+        instruction.transfer.instrumentId `elem` poolInstrumentsOf pool
+      require "Transfer amount must be positive" $ instruction.transfer.amount > 0.0
+      require "Transfer must await receiver acceptance" $
+        instruction.status == TransferInstructionV1.TransferPendingReceiverAcceptance
 
 aligned : Int -> TickRange -> Bool
 aligned spacing r =
@@ -482,8 +546,8 @@ prepareInstrument
 prepareInstrument order ctx instrument debits = do
   validateContext order.venue order.actor order.pool.ammId (poolInstrumentsOf order.pool) ctx
   case debits of
-    -- No debit for this instrument: the context only supplies a receiving
-    -- allocation.
+    -- No actor debit for this instrument: the context only supplies a
+    -- receiving allocation or a direct-funding refund receiver.
     [] -> pure ([], [])
     _ -> do
       require "One instrument must have exactly one planned debit" $
@@ -515,10 +579,12 @@ prepareInstrument order ctx instrument debits = do
           outcome <- prepareDebit order.venue order.actor order.pool.ammId
             (poolInstrumentsOf order.pool) ctx debit.amount (map coerceContractId holdingCids)
           pure ([outcome.allocationCid], outcome.changeHoldingCids)
-        DebitTransfer instructionCids -> do
+        DebitTransferToActor instructionCids -> do
           holdingCids <- concat <$> forA instructionCids (acceptTransferInstruction order.actor ctx)
           outcome <- prepareDebit order.venue order.actor order.pool.ammId (poolInstrumentsOf order.pool) ctx debit.amount holdingCids
           pure ([outcome.allocationCid], outcome.changeHoldingCids)
+        DebitTransferToVault _ ->
+          fail "TC.Public.Order.prepareInstrument: vault debit requires a vault context"
 
 requireAllocationFunding
   : Order -> InstrumentContext -> Decimal -> ContractId AllocationV2.Allocation -> Update ()
@@ -551,7 +617,10 @@ validateDebit order debit = do
         (FundingStanding, DebitStanding _) -> True
         (FundingAllocations signed, DebitAllocations supplied) -> signedSources signed supplied
         (FundingHoldings signed, DebitHoldings supplied) -> signedSources signed supplied
-        (FundingTransfers signed, DebitTransfer supplied) -> signedSources signed supplied
+        (FundingTransfersToActor signed, DebitTransferToActor supplied) ->
+          signedSources signed supplied
+        (FundingTransfersToVault signed, DebitTransferToVault supplied) ->
+          signedSources signed supplied
         _ -> False
   require "Debit sources must come from the order's signed funding" sourceMatches
 

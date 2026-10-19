@@ -91,7 +91,7 @@ data Operation
 
 -- | The funding source selected at order creation.
 --
--- The three explicit kinds each require a nonempty list. One order must
+-- The four explicit kinds each require a nonempty list. One order must
 -- not mix source kinds.
 data Funding
   = FundingStanding
@@ -103,9 +103,18 @@ data Funding
   | FundingHoldings
     with
       holdingCids : [ContractId Holding]
-  | FundingTransfers
+  | FundingTransfersToActor
     with
       instructionCids : [ContractId TransferInstruction]
+    -- ^ Pending transfer offers addressed to the order actor.
+    --   Acceptance uses the actor's receiving authority.
+  | FundingTransfersToVault
+    with
+      instructionCids : [ContractId TransferInstruction]
+    -- ^ Pending transfer offers from the order actor to the pool vault.
+    --   Preparation accepts them under the vault's receiving authority,
+    --   funds a vault-owned allocation by exactly the planned debit,
+    --   and returns any surplus to the actor as ordinary holdings.
   deriving (Eq, Ord, Show)
 
 -- | Per-instrument maximum debit amounts. A maximum is a limit, not proof
@@ -159,7 +168,8 @@ data InstrumentContext = InstrumentContext
   with
     instrument : InstrumentId
     account : Account
-    -- ^ The actor's holding account.
+    -- ^ Actor account for ordinary funding, outputs, or a direct-funding
+    --   refund; vault account for direct transfer funding.
     targetAllocationCid : Optional (ContractId Allocation)
     -- ^ Selected standing allocation; None lets preparation create one.
     allocationFactoryCid : ContractId AllocationFactory
@@ -192,9 +202,17 @@ data DebitSource
   | DebitHoldings
     with
       holdingCids : [ContractId Holding]
-  | DebitTransfer
+  | DebitTransferToActor
     with
       instructionCids : [ContractId TransferInstruction]
+    -- ^ Pending transfer offers addressed to the order actor. Acceptance
+    --   credits the actor, and the actor's context funds the debit.
+  | DebitTransferToVault
+    with
+      instructionCids : [ContractId TransferInstruction]
+    -- ^ Pending transfer offers from the order actor to the pool vault.
+    --   The vault's context funds the debit directly; a surplus returns
+    --   to the actor as ordinary holdings.
   deriving (Eq, Ord, Show)
 
 -- | Absolute bound for token and liquidity amounts. Larger values cannot
