@@ -14,6 +14,7 @@ module TC.Public.Order
   , Order_Expire(..)
   , Order_PrepareFunding(..)
   , Order_PrepareFunding_Result(..)
+  , Order_ReadFundingSource(..)
   , Order_Complete(..)
   , Result(..)
   , Result_MarkSettled(..)
@@ -24,7 +25,7 @@ module TC.Public.Order
 import DA.Foldable (forA_)
 import DA.Map (Map)
 import DA.Map qualified as Map
-import DA.Optional (fromOptional, isSome)
+import DA.Optional (fromOptional, isNone, isSome)
 import DA.Set qualified as Set
 import DA.TextMap qualified as TextMap
 
@@ -309,6 +310,34 @@ template Order
             | (_, (_, changeCids)) <- prepared
             ]
 
+    -- | Read one signed funding source. The venue and vault controllers
+    -- supply the read, and the order's actor and vault signatories
+    -- authorize fetching the one named source; no other source read or
+    -- token action is authorized. The kind and signed-membership checks
+    -- run before any source fetch, so an unsigned or wrong-kind CID is
+    -- never fetched. Semantic invalidity of a signed source is a Left; a
+    -- stale or inaccessible CID remains a transaction error. The choice
+    -- performs no token action, no preparation, and no completion.
+    nonconsuming choice Order_ReadFundingSource : Either Text FundingSourceView
+      with
+        source : FundingSource
+      controller venue, vault
+      do
+        case (input.funding, source) of
+          (FundingHoldings cids, FundingSourceHolding cid)
+            | not (cid `elem` cids) ->
+              pure (Left "Funding source holding is not signed by this order")
+            | otherwise -> readHoldingSource this cid
+          (FundingTransfersToActor cids, FundingSourceTransfer cid)
+            | not (cid `elem` cids) ->
+              pure (Left "Funding source offer is not signed by this order")
+            | otherwise -> readIncomingOfferSource this cid
+          (FundingTransfersToVault cids, FundingSourceTransfer cid)
+            | not (cid `elem` cids) ->
+              pure (Left "Funding source offer is not signed by this order")
+            | otherwise -> readVaultOfferSource this cid
+          _ -> pure (Left "Funding source kind must match the order's funding kind")
+
     -- | Complete the order with its actual amounts and position snapshot.
     -- Successful partial fills must still satisfy the actor's signed limits.
     choice Order_Complete : ContractId Result
@@ -501,6 +530,62 @@ validateFundingSources actor pool = \case
       require "Transfer amount must be positive" $ instruction.transfer.amount > 0.0
       require "Transfer must await receiver acceptance" $
         instruction.status == TransferInstructionV1.TransferPendingReceiverAcceptance
+
+-- | Read one signed holding under the order's actor and vault
+-- signatures. Current funding validation semantics apply: the owner,
+-- instrument, amount, and lock state must match a usable actor holding.
+readHoldingSource : Order -> ContractId HoldingV1.Holding -> Update (Either Text FundingSourceView)
+readHoldingSource order cid = do
+  holding <- view <$> fetch @HoldingV1.Holding cid
+  pure $ do
+    requireE "Holding owner must be the order actor" $ holding.owner == order.actor
+    requireE "Holding instrument must be a pool instrument" $
+      holding.instrumentId `elem` poolInstrumentsOf order.pool
+    requireE "Holding amount must be positive" $ holding.amount > 0.0
+    requireE "Holding must be unlocked" $ isNone holding.lock
+    Right FundingSourceView with
+      instrument = holding.instrumentId
+      amount = holding.amount
+
+-- | Read one signed offer addressed to the order actor. The receiver,
+-- instrument, amount, and pending status must match a usable incoming
+-- offer.
+readIncomingOfferSource
+  : Order -> ContractId TransferInstructionV1.TransferInstruction -> Update (Either Text FundingSourceView)
+readIncomingOfferSource order cid = do
+  instruction <- view <$> fetch @TransferInstructionV1.TransferInstruction cid
+  pure $ do
+    requireE "Transfer receiver must be the order actor" $
+      instruction.transfer.receiver == order.actor
+    requireE "Transfer instrument must be a pool instrument" $
+      instruction.transfer.instrumentId `elem` poolInstrumentsOf order.pool
+    requireE "Transfer amount must be positive" $ instruction.transfer.amount > 0.0
+    requireE "Transfer must await receiver acceptance" $
+      instruction.status == TransferInstructionV1.TransferPendingReceiverAcceptance
+    Right FundingSourceView with
+      instrument = instruction.transfer.instrumentId
+      amount = instruction.transfer.amount
+
+-- | Read one signed offer from the order actor to the pool vault. The
+-- sender, receiver, instrument, amount, and pending status must match a
+-- usable direct vault offer.
+readVaultOfferSource
+  : Order -> ContractId TransferInstructionV1.TransferInstruction -> Update (Either Text FundingSourceView)
+readVaultOfferSource order cid = do
+  instruction <- view <$> fetch @TransferInstructionV1.TransferInstruction cid
+  pure $ do
+    requireE "Transfer sender must be the order actor" $
+      instruction.transfer.sender == order.actor
+    requireE "Transfer receiver must be the pool vault" $
+      instruction.transfer.receiver == order.vault
+    requireE "Transfer instrument must be a pool instrument" $
+      instruction.transfer.instrumentId `elem` poolInstrumentsOf order.pool
+    requireE "Transfer amount must be positive" $ instruction.transfer.amount > 0.0
+    requireE "Transfer must await receiver acceptance" $
+      instruction.status == TransferInstructionV1.TransferPendingReceiverAcceptance
+    Right FundingSourceView with
+      instrument = instruction.transfer.instrumentId
+      amount = instruction.transfer.amount
 
 aligned : Int -> TickRange -> Bool
 aligned spacing r =
