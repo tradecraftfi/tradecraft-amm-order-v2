@@ -23,6 +23,7 @@ module TC.Public.Order
   ) where
 
 import DA.Foldable (forA_)
+import DA.List qualified as List
 import DA.Map (Map)
 import DA.Map qualified as Map
 import DA.Optional (fromOptional, isNone, isSome)
@@ -122,12 +123,9 @@ template Factory
     -- | Fund a standing settlement allocation from the actor's holdings.
     nonconsuming choice Factory_FundStandingAllocation : Factory_FundStandingAllocation_Result
       with
-        actor : Party
         args : FundSettlementAllocationArgs
-      controller actor
+      controller args.allocationActor
       do
-        require "Allocation actor must be the caller" $
-          args.allocationActor == actor
         require "Funding must belong to this pool" $
           args.ammId == pool.ammId && args.instruments == factoryInstruments this
         require "Funding venue must be the factory venue" $
@@ -223,7 +221,7 @@ template Order
         require "Order must not be expired" $ notExpired expiresAt now
         orderRecord <- fetch self
         require "Planned debits must name distinct instruments" $
-          allDistinct (map (.instrument) plannedDebits)
+          List.unique (map (.instrument) plannedDebits)
         forA_ plannedDebits \debit -> validateDebit orderRecord debit
         validateOutputs orderRecord plannedOutputs
         require "Context accounts must have an owner" $
@@ -353,8 +351,8 @@ template Order
         case outcome of
           OutcomeRejected _ ->
             require "Rejected orders must not record payment legs" $
-              all (== 0.0) (mapValues actualInputs)
-                && all (== 0.0) (mapValues actualOutputs)
+              all (== 0.0) (Map.values actualInputs)
+                && all (== 0.0) (Map.values actualOutputs)
           _ -> do
             require "Actual inputs must name pool instruments" $
               all (`elem` poolInstrumentsOf pool) (Map.keys actualInputs)
@@ -425,13 +423,13 @@ validateOrderStatic pool tickSpacing spec = do
   requireE "Input instruments must be pool instruments" $
     all (`elem` poolInstrumentsOf pool) (Map.keys spec.input.maxDebits)
   requireE "Input maxima must be positive and within the amount bound" $
-    all validAmount (mapValues spec.input.maxDebits)
+    all validAmount (Map.values spec.input.maxDebits)
   requireE "Explicit funding must name distinct, nonempty sources" $
     validFunding spec.input.funding
   requireE "Output instruments must be pool instruments" $
     all (`elem` poolInstrumentsOf pool) (Map.keys spec.output.minOutputs)
   requireE "Output minima must be nonnegative and within the amount bound" $
-    all (\a -> a >= 0.0 && a <= maxAmountBound) (mapValues spec.output.minOutputs)
+    all (\a -> a >= 0.0 && a <= maxAmountBound) (Map.values spec.output.minOutputs)
   case spec.operation of
     OpSwap dir limit -> do
       requireE "Price limit must be positive" $ limit > 0.0
@@ -470,9 +468,6 @@ validateOrderStatic pool tickSpacing spec = do
       requireE "Collection funding must be standing" $
         spec.input.funding == FundingStanding
 
-mapValues : Map k v -> [v]
-mapValues m = [v | (_k, v) <- Map.toList m]
-
 poolInstrumentsOf : PoolRef -> [InstrumentId]
 poolInstrumentsOf p = [p.instrument1, p.instrument2]
 
@@ -481,13 +476,10 @@ poolInstrumentsOf p = [p.instrument1, p.instrument2]
 validFunding : Funding -> Bool
 validFunding = \case
   FundingStanding -> True
-  FundingAllocations cids -> not (null cids) && allDistinct cids
-  FundingHoldings cids -> not (null cids) && allDistinct cids
-  FundingTransfersToActor cids -> not (null cids) && allDistinct cids
-  FundingTransfersToVault cids -> not (null cids) && allDistinct cids
-
-allDistinct : Ord a => [a] -> Bool
-allDistinct values = Set.size (Set.fromList values) == length values
+  FundingAllocations cids -> not (null cids) && List.unique cids
+  FundingHoldings cids -> not (null cids) && List.unique cids
+  FundingTransfersToActor cids -> not (null cids) && List.unique cids
+  FundingTransfersToVault cids -> not (null cids) && List.unique cids
 
 -- Source validation does not reserve or consume tokens.
 validateFundingSources : Party -> PoolRef -> Funding -> Update ()
@@ -592,7 +584,7 @@ aligned spacing r =
   spacing > 0 && (r.lower % spacing) == 0 && (r.upper % spacing) == 0
 
 nonnegativeMap : Map InstrumentId Decimal -> Bool
-nonnegativeMap = all (>= 0.0) . mapValues
+nonnegativeMap = all (>= 0.0) . Map.values
 
 notExpired : Optional Time -> Time -> Bool
 notExpired expiry now = case expiry of
@@ -712,7 +704,7 @@ validateDebit order debit = do
 signedSources : Ord a => [a] -> [a] -> Bool
 signedSources signed supplied =
   let authorized = Set.fromList signed
-  in not (null supplied) && allDistinct supplied
+  in not (null supplied) && List.unique supplied
     && all (`Set.member` authorized) supplied
 
 -- Supplied legs can describe a partial fill. Explicit minima still apply.
@@ -721,7 +713,7 @@ validateOutputs order outputs = do
   require "Outputs must name pool instruments" $
     all (`elem` poolInstrumentsOf order.pool) (Map.keys outputs)
   require "Outputs must be nonnegative and within the amount bound" $
-    all (\amount -> amount >= 0.0 && amount <= maxAmountBound) (mapValues outputs)
+    all (\amount -> amount >= 0.0 && amount <= maxAmountBound) (Map.values outputs)
   require "Outputs must satisfy the order's minimums" $
     all (\(instrument, minimum) -> fromOptional 0.0 (Map.lookup instrument outputs) >= minimum)
       (Map.toList order.output.minOutputs)
