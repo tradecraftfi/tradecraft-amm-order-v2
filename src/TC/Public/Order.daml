@@ -53,6 +53,7 @@ import TC.Public.Order.Allocation
   , requireSome
   , validateContext
   )
+import TC.Public.Order.Halt (HaltEvidence, PoolHalts, assertPoolOpen)
 import TC.Public.Order.Types
 
 -- | Partners submit through this disclosed factory, not the core pool rules.
@@ -63,6 +64,7 @@ template Factory
     vault : Party
     pool : PoolRef
     tickSpacing : Int
+    halts : Optional PoolHalts
   where
     signatory venue, vault
 
@@ -99,6 +101,7 @@ template Factory
             output = spec.output
             createdAt = now
             expiresAt = spec.expiresAt
+            halts
         pure Factory_CreateOrders_Result with orderCids
 
     -- | Create a standing settlement allocation for the actor. The choice
@@ -107,6 +110,7 @@ template Factory
       with
         actor : Party
         args : CreateSettlementAllocationArgs
+        haltEvidence : Optional HaltEvidence
       controller actor
       do
         require "Allocation actor must be the caller" $
@@ -115,6 +119,7 @@ template Factory
           args.ammId == pool.ammId && args.instruments == factoryInstruments this
         require "Allocation venue must be the factory venue" $
           args.venue == venue
+        assertPoolOpen pool halts haltEvidence
         (allocationCid, changeCids) <- createSettlementAllocation args
         pure Factory_CreateStandingAllocation_Result with
           allocationCid
@@ -124,12 +129,14 @@ template Factory
     nonconsuming choice Factory_FundStandingAllocation : Factory_FundStandingAllocation_Result
       with
         args : FundSettlementAllocationArgs
+        haltEvidence : Optional HaltEvidence
       controller args.allocationActor
       do
         require "Funding must belong to this pool" $
           args.ammId == pool.ammId && args.instruments == factoryInstruments this
         require "Funding venue must be the factory venue" $
           args.venue == venue
+        assertPoolOpen pool halts haltEvidence
         (successorCid, changeCids) <- fundSettlementAllocation args
         pure Factory_FundStandingAllocation_Result with
           allocationCid = successorCid
@@ -169,6 +176,7 @@ template Order
     output : Output
     createdAt : Time
     expiresAt : Optional Time
+    halts : Optional PoolHalts
   where
     signatory actor, vault
     observer venue
@@ -215,11 +223,13 @@ template Order
         plannedDebits : [PlannedDebit]
         plannedOutputs : Map InstrumentId Decimal
         contexts : [InstrumentContext]
+        haltEvidence : Optional HaltEvidence
       controller venue, vault
       do
         now <- getTime
         require "Order must not be expired" $ notExpired expiresAt now
         orderRecord <- fetch self
+        assertPoolOpen orderRecord.pool halts haltEvidence
         require "Planned debits must name distinct instruments" $
           List.unique (map (.instrument) plannedDebits)
         forA_ plannedDebits \debit -> validateDebit orderRecord debit

@@ -1,0 +1,463 @@
+-- Security-control halts for public funding and core V7 execution.
+-- A control belongs to one venue and one underlying security. Its state is a
+-- single live contract that any authorized slot can advance. A guarded
+-- operation reads the current state through 'SecurityControl_CheckOpen'.
+module TC.Public.Order.Halt
+  ( HoldControllers(..)
+  , ExplicitHoldReason(..)
+  , MarketStatus(..)
+  , SecurityControlConfig(..)
+  , MarketObservation(..)
+  , HoldKey(..)
+  , ExplicitHold(..)
+  , HaltScope(..)
+  , PoolHalts(..)
+  , HaltEvidence(..)
+  , SecurityControlSetup(..)
+  , SecurityControlSetup_Activate(..)
+  , SecurityControlSetup_Activate_Result(..)
+  , SecurityControl(..)
+  , SecurityControl_SetHold(..)
+  , SecurityControl_ReleaseHold(..)
+  , SecurityControl_BeginCoverage(..)
+  , SecurityControl_PublishMarketStatus(..)
+  , SecurityControl_SetMaxEvidenceAge(..)
+  , SecurityControl_CheckOpen(..)
+  , SecurityState(..)
+  , validatePoolHalts
+  , assertPoolOpen
+  ) where
+
+import DA.Foldable (forA_)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Set (Set)
+import DA.Set qualified as Set
+import DA.Time (RelTime, addRelTime, microseconds)
+
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+import TC.Public.Order.Types (PoolRef(..))
+
+-- | One party per control reason. Several slots may name the same party.
+data HoldControllers = HoldControllers
+  with
+    market : Party
+    manual : Party
+    legal : Party
+    security : Party
+    corporateAction : Party
+    volume : Party
+  deriving (Eq, Show)
+
+-- | The hold reasons a controller can set and release. A market condition is
+-- separate evidence, not a hold.
+data ExplicitHoldReason
+  = HoldReason_Manual
+  | HoldReason_Legal
+  | HoldReason_Security
+  | HoldReason_CorporateAction
+  | HoldReason_Volume
+  deriving (Eq, Ord, Show)
+
+-- | A traded status. Unknown coverage is the absence of valid evidence, not
+-- a third status.
+data MarketStatus
+  = MarketStatus_Tradable
+  | MarketStatus_Halted
+  deriving (Eq, Show)
+
+-- | One control identity. The security identifier is a stable underlying
+-- identifier within the venue, not a ticker or pool name. Every token
+-- instrument of the same underlying belongs to this one control.
+data SecurityControlConfig = SecurityControlConfig
+  with
+    configurationAuthority : Party
+    venue : Party
+    securityId : Text
+    instruments : Set InstrumentId
+    controllers : HoldControllers
+  deriving (Eq, Show)
+
+-- | One qualified source statement. The observed-through time is the end of
+-- continuous coverage, not the time a worker ran.
+data MarketObservation = MarketObservation
+  with
+    status : MarketStatus
+    sourceStatusAt : Time
+    observedThrough : Time
+    evidenceRef : Text
+  deriving (Eq, Show)
+
+-- | One explicit hold identity. The reference text must be an opaque
+-- operational reference, because disclosure exposes it.
+data HoldKey = HoldKey
+  with
+    reason : ExplicitHoldReason
+    holdId : Text
+  deriving (Eq, Ord, Show)
+
+data ExplicitHold = ExplicitHold
+  with
+    placedAt : Time
+    evidenceRef : Text
+  deriving (Eq, Show)
+
+-- | A pool instrument leg. A controlled leg names the shared security
+-- control; an unrestricted leg accepts any instrument.
+data HaltScope
+  = HaltScope_Unrestricted
+  | HaltScope_Controlled (ContractId SecurityControl)
+  deriving (Eq, Show)
+
+-- | The halt binding of one pool. The map must name exactly the two pool
+-- instruments.
+data PoolHalts = PoolHalts
+  with
+    instruments : Map InstrumentId HaltScope
+  deriving (Eq, Show)
+
+-- | The current state contract of every required control, supplied by the
+-- caller. Disclosures make these contracts readable; they do not prove the
+-- identity or authority checks of 'SecurityControl_CheckOpen'.
+data HaltEvidence = HaltEvidence
+  with
+    states : Map (ContractId SecurityControl) (ContractId SecurityState)
+  deriving (Eq, Show)
+
+-- | One-time setup. Activating it creates the immutable root and the initial
+-- state in one transaction.
+template SecurityControlSetup
+  with
+    config : SecurityControlConfig
+  where
+    signatory controlSignatories config
+    observer config.venue
+
+    ensure
+      validConfig config
+
+    choice SecurityControlSetup_Activate : SecurityControlSetup_Activate_Result
+      with
+        maxEvidenceAge : RelTime
+      controller config.configurationAuthority
+      do
+        require "Evidence age must be positive" $
+          maxEvidenceAge > microseconds 0
+        now <- getTime
+        controlCid <- create SecurityControl with config
+        stateCid <- create SecurityState with
+          controlCid
+          config
+          revision = 0
+          generation = 0
+          maxEvidenceAge
+          lastObservation = None
+          validUntil = None
+          holds = Map.empty
+          updatedAt = now
+        pure SecurityControlSetup_Activate_Result with controlCid, stateCid
+
+data SecurityControlSetup_Activate_Result = SecurityControlSetup_Activate_Result
+  with
+    controlCid : ContractId SecurityControl
+    stateCid : ContractId SecurityState
+  deriving (Eq, Show)
+
+-- | State changes consume the previous state contract. Old state witnesses
+-- cannot authorize later operations.
+template SecurityControl
+  with
+    config : SecurityControlConfig
+  where
+    signatory controlSignatories config
+    observer config.venue
+
+    ensure
+      validConfig config
+
+    -- | Add one explicit hold. Other holds and market evidence stay.
+    nonconsuming choice SecurityControl_SetHold : ContractId SecurityState
+      with
+        stateCid : ContractId SecurityState
+        expectedRevision : Int
+        reason : ExplicitHoldReason
+        holdId : Text
+        evidenceRef : Text
+      controller reasonController config.controllers reason
+      do
+        state <- currentState self this stateCid expectedRevision
+        require "Hold identifier must not be empty" $ holdId /= ""
+        require "Hold evidence reference must not be empty" $ evidenceRef /= ""
+        let key = HoldKey with reason, holdId
+        require "Hold is already active" $ not (Map.member key state.holds)
+        now <- getTime
+        archive stateCid
+        create state with
+          revision = state.revision + 1
+          holds = Map.insert key (ExplicitHold with placedAt = now, evidenceRef) state.holds
+          updatedAt = now
+
+    -- | Remove exactly one active hold. Other holds and market evidence stay.
+    nonconsuming choice SecurityControl_ReleaseHold : ContractId SecurityState
+      with
+        stateCid : ContractId SecurityState
+        expectedRevision : Int
+        reason : ExplicitHoldReason
+        holdId : Text
+        evidenceRef : Text
+      controller reasonController config.controllers reason
+      do
+        state <- currentState self this stateCid expectedRevision
+        require "Release evidence reference must not be empty" $ evidenceRef /= ""
+        let key = HoldKey with reason, holdId
+        require "Hold is not active" $ Map.member key state.holds
+        now <- getTime
+        archive stateCid
+        create state with
+          revision = state.revision + 1
+          holds = Map.delete key state.holds
+          updatedAt = now
+
+    -- | Start, restart, or repair coverage. New coverage needs a new
+    -- generation, so a publisher that kept an old generation is rejected.
+    nonconsuming choice SecurityControl_BeginCoverage : ContractId SecurityState
+      with
+        stateCid : ContractId SecurityState
+        expectedRevision : Int
+      controller config.controllers.market
+      do
+        state <- currentState self this stateCid expectedRevision
+        now <- getTime
+        archive stateCid
+        create state with
+          revision = state.revision + 1
+          generation = state.generation + 1
+          validUntil = None
+          updatedAt = now
+
+    nonconsuming choice SecurityControl_PublishMarketStatus : ContractId SecurityState
+      with
+        stateCid : ContractId SecurityState
+        expectedRevision : Int
+        generation : Int
+        observation : MarketObservation
+      controller config.controllers.market
+      do
+        state <- currentState self this stateCid expectedRevision
+        now <- getTime
+        require "Observation generation must match the live state" $
+          generation == state.generation
+        require "Observation source time must not follow its coverage time" $
+          observation.sourceStatusAt <= observation.observedThrough
+        require "Observation coverage must not be in the future" $
+          observation.observedThrough <= now
+        require "Observation evidence reference must not be empty" $
+          observation.evidenceRef /= ""
+        case state.lastObservation of
+          None -> pure ()
+          Some previous -> do
+            require "Observation coverage must advance strictly" $
+              observation.observedThrough > previous.observedThrough
+            require "Observation source time must not decrease" $
+              observation.sourceStatusAt >= previous.sourceStatusAt
+            require
+              "Observation contradicts the recorded status at the same source time; publish a later source time" $
+              observation.sourceStatusAt /= previous.sourceStatusAt
+                || observation.status == previous.status
+        let deadline = addRelTime observation.observedThrough state.maxEvidenceAge
+        require "Published coverage must not be expired" $ now < deadline
+        archive stateCid
+        create state with
+          revision = state.revision + 1
+          lastObservation = Some observation
+          validUntil = Some deadline
+          updatedAt = now
+
+    -- | Change the evidence-age limit. This invalidates the live coverage and
+    -- keeps every hold, so a longer limit cannot revive old evidence.
+    nonconsuming choice SecurityControl_SetMaxEvidenceAge : ContractId SecurityState
+      with
+        stateCid : ContractId SecurityState
+        expectedRevision : Int
+        maxEvidenceAge : RelTime
+      controller config.configurationAuthority
+      do
+        state <- currentState self this stateCid expectedRevision
+        require "Evidence age must be positive" $ maxEvidenceAge > microseconds 0
+        now <- getTime
+        archive stateCid
+        create state with
+          revision = state.revision + 1
+          generation = state.generation + 1
+          maxEvidenceAge
+          validUntil = None
+          updatedAt = now
+
+    -- | Succeed only for a fresh, tradable, hold-free state of this control.
+    -- Guard failures abort the transaction; they are not data.
+    nonconsuming choice SecurityControl_CheckOpen : ()
+      with
+        stateCid : ContractId SecurityState
+        venue : Party
+        instruments : Set InstrumentId
+      controller venue
+      do
+        require "Checked venue must be the control venue" $
+          venue == config.venue
+        require "Checked instruments must not be empty" $
+          not (Set.null instruments)
+        require "Checked instruments must belong to the control" $
+          instruments `Set.isSubsetOf` config.instruments
+        state <- fetch stateCid
+        require "Halt state must belong to this control" $
+          state.controlCid == self
+        require "Halt state configuration must match this control" $
+          state.config == config
+        now <- getTime
+        require "Every explicit hold must be released" $ Map.null state.holds
+        observation <- case state.lastObservation of
+          Some observed -> pure observed
+          None -> abort "Market status evidence is absent"
+        require "Market status must be tradable" $
+          observation.status == MarketStatus_Tradable
+        deadline <- case state.validUntil of
+          Some value -> pure value
+          None -> abort "Market status coverage is absent"
+        require "Market status coverage has expired" $ now < deadline
+
+-- | The single live state of one control. The state has no application
+-- choices; every transition runs through the root.
+template SecurityState
+  with
+    controlCid : ContractId SecurityControl
+    config : SecurityControlConfig
+    revision : Int
+    generation : Int
+    maxEvidenceAge : RelTime
+    lastObservation : Optional MarketObservation
+    validUntil : Optional Time
+    holds : Map HoldKey ExplicitHold
+    updatedAt : Time
+  where
+    signatory controlSignatories config
+    observer config.venue
+
+    ensure
+      validConfig config
+      && revision >= 0
+      && generation >= 0
+      && maxEvidenceAge > microseconds 0
+      && optional True
+        (\deadline -> case lastObservation of
+          Some observed -> deadline == addRelTime observed.observedThrough maxEvidenceAge
+          None -> False)
+        validUntil
+
+-- | Every control party signs. This is a stated trust limit: all of them
+-- together can create or archive a state outside the normal protocol.
+controlSignatories : SecurityControlConfig -> [Party]
+controlSignatories config =
+  dedupParties
+    [ config.configurationAuthority
+    , config.controllers.market
+    , config.controllers.manual
+    , config.controllers.legal
+    , config.controllers.security
+    , config.controllers.corporateAction
+    , config.controllers.volume
+    ]
+
+dedupParties : [Party] -> [Party]
+dedupParties [] = []
+dedupParties (party :: rest) =
+  party :: dedupParties [other | other <- rest, other /= party]
+
+validConfig : SecurityControlConfig -> Bool
+validConfig config =
+  config.securityId /= ""
+    && not (Set.null config.instruments)
+
+reasonController : HoldControllers -> ExplicitHoldReason -> Party
+reasonController controllers = \case
+  HoldReason_Manual -> controllers.manual
+  HoldReason_Legal -> controllers.legal
+  HoldReason_Security -> controllers.security
+  HoldReason_CorporateAction -> controllers.corporateAction
+  HoldReason_Volume -> controllers.volume
+
+currentState
+  : ContractId SecurityControl
+  -> SecurityControl
+  -> ContractId SecurityState
+  -> Int
+  -> Update SecurityState
+currentState self control stateCid expectedRevision = do
+  state <- fetch stateCid
+  require "Halt state must belong to this control" $ state.controlCid == self
+  require "Halt state configuration must match this control" $
+    state.config == control.config
+  require "Halt state revision must match the expected revision" $
+    state.revision == expectedRevision
+  pure state
+
+-- | Check a pool halt binding against the pool and the live controls it
+-- names. A generic pool has no binding and no check.
+validatePoolHalts : PoolRef -> Optional PoolHalts -> Update ()
+validatePoolHalts pool halts = case halts of
+  None -> pure ()
+  Some binding -> do
+    require "Pool halts must name exactly the two pool instruments" $
+      Set.fromList (Map.keys binding.instruments)
+        == Set.fromList [pool.instrument1, pool.instrument2]
+    require "At least one pool instrument must be controlled" $
+      any isControlled (Map.values binding.instruments)
+    forA_ (Map.toList (controlledByControl binding)) \(controlCid, instruments) -> do
+      control <- fetch controlCid
+      require "Security control venue must be the pool venue" $
+        control.config.venue == pool.venue
+      require "Security control must name every mapped pool instrument" $
+        all (`Set.member` control.config.instruments) instruments
+
+-- | Require fresh, tradable, hold-free coverage of every controlled leg.
+-- A generic pool accepts no evidence and exercises no control.
+assertPoolOpen : PoolRef -> Optional PoolHalts -> Optional HaltEvidence -> Update ()
+assertPoolOpen pool halts evidence = case halts of
+  None -> case evidence of
+    None -> pure ()
+    Some witness ->
+      require "A generic pool accepts no halt evidence" $
+        Map.null witness.states
+  Some binding -> do
+    witness <- case evidence of
+      Some supplied -> pure supplied
+      None -> abort "Halt evidence is required for a controlled pool"
+    let required = controlledByControl binding
+    require "Halt evidence must name exactly the required controls" $
+      Set.fromList (Map.keys witness.states) == Set.fromList (Map.keys required)
+    forA_ (Map.toList required) \(controlCid, instruments) -> do
+      stateCid <- case Map.lookup controlCid witness.states of
+        Some cid -> pure cid
+        None -> abort "Halt evidence is missing a required control"
+      exercise controlCid SecurityControl_CheckOpen with
+        stateCid
+        venue = pool.venue
+        instruments = Set.fromList instruments
+
+isControlled : HaltScope -> Bool
+isControlled = \case
+  HaltScope_Unrestricted -> False
+  HaltScope_Controlled _ -> True
+
+-- | Group the controlled pool instruments by control identity. One control
+-- that serves both instruments appears once.
+controlledByControl : PoolHalts -> Map (ContractId SecurityControl) [InstrumentId]
+controlledByControl binding =
+  Map.fromListWithR (<>)
+    [ (controlCid, [instrument])
+    | (instrument, HaltScope_Controlled controlCid) <- Map.toList binding.instruments
+    ]
+
+require : Text -> Bool -> Update ()
+require message condition =
+  if condition then pure () else abort message
