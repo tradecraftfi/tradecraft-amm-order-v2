@@ -1,0 +1,69 @@
+-- A trader-visible record of one owner recovery. The core pool creates it
+-- when a recovery authority segregates the positions of an owner. The owner
+-- and the destination read it without the private core package. It records
+-- each segregated position. A position with no payable amount is also
+-- recorded.
+
+module TC.Public.Order.Recovery
+  ( RecoveryReceipt(..)
+  , RecoveredPosition(..)
+  ) where
+
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Set qualified as Set
+
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+import TC.Public.Order.Types (PoolRef(..), PositionSnapshot(..), isValidRange)
+
+-- | One segregated position. 'snapshot' is its state before the recovery.
+-- 'principal' and 'accruedFees' are the payment-scale amounts per
+-- instrument. If an instrument is not in a map, the recovery pays nothing
+-- for it. Raw rounding remainders stay in the pool. They are not part of
+-- this record.
+data RecoveredPosition = RecoveredPosition
+  with
+    snapshot : PositionSnapshot
+    principal : Map InstrumentId Decimal
+    accruedFees : Map InstrumentId Decimal
+  deriving (Eq, Ord, Show)
+
+-- | Durable evidence of one completed recovery for the owner and the
+-- destination. The vault signs. The record has no choice and does not
+-- change. 'moved' is the total paid to the destination per instrument.
+-- 'externalCutoff' is the record date of the authority. 'executedAt' is
+-- the ledger time of the recovery.
+template RecoveryReceipt
+  with
+    pool : PoolRef
+    owner : Party
+    destination : Party
+    instructionId : Text
+    positions : [RecoveredPosition]
+    moved : Map InstrumentId Decimal
+    executedAt : Time
+    externalCutoff : Time
+  where
+    signatory pool.vault
+    observer owner, destination, pool.venue
+
+    ensure
+      instructionId /= ""
+      && not (null positions)
+      && all validRecoveredPosition positions
+      && all (\p -> p.snapshot.owner == owner && p.snapshot.ammId == pool.ammId) positions
+      && Set.size (Set.fromList (map (\p -> p.snapshot.range) positions))
+        == length positions
+      && nonnegativeMap moved
+      && all (`elem` [pool.instrument1, pool.instrument2]) (Map.keys moved)
+
+validRecoveredPosition : RecoveredPosition -> Bool
+validRecoveredPosition p =
+  isValidRange p.snapshot.range
+    && p.snapshot.liquidity >= 0.0
+    && nonnegativeMap p.principal
+    && nonnegativeMap p.accruedFees
+
+nonnegativeMap : Map InstrumentId Decimal -> Bool
+nonnegativeMap m = all (>= 0.0) (Map.values m)
