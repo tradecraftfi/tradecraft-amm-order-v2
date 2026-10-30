@@ -82,16 +82,17 @@ The package does not depend on the Tradecraft core package. It is the only Trade
 
 ### The built DAR
 
-[`dist/tradecraft-amm-order-v2-2.1.0.dar`](dist/tradecraft-amm-order-v2-2.1.0.dar) is the built package, made with Daml SDK 3.5.1. It contains the package and all of its dependencies, so you upload only this file.
+The built package is attached to the [v2.1.0 release](https://github.com/tradecraftfi/tradecraft-amm-order-v2/releases/tag/v2.1.0) as [`tradecraft-amm-order-v2-2.1.0.dar`](https://github.com/tradecraftfi/tradecraft-amm-order-v2/releases/download/v2.1.0/tradecraft-amm-order-v2-2.1.0.dar). It was made with Daml SDK 3.5.1. It contains the package and all of its dependencies, so you upload only this file.
 
 - Package ID - `00e7b3e8adb051dd4e79f86b87c55d2d6126d13f463a0f9b86ba2dcd5ad12350`
 - SHA-256 - `de29c0c75de149b4133c332ad4bebefb766d2a4ec1f64c9555dab4c899678e6a`
 
-Check the file before you upload it:
+Download the file and check it before you upload it:
 
 ```shell
-shasum -a 256 dist/tradecraft-amm-order-v2-2.1.0.dar
-unzip -l dist/tradecraft-amm-order-v2-2.1.0.dar | grep -o '/tradecraft-amm-order-v2-2.1.0-[0-9a-f]*\.dalf'
+curl -LO https://github.com/tradecraftfi/tradecraft-amm-order-v2/releases/download/v2.1.0/tradecraft-amm-order-v2-2.1.0.dar
+shasum -a 256 tradecraft-amm-order-v2-2.1.0.dar
+unzip -l tradecraft-amm-order-v2-2.1.0.dar | grep -o '/tradecraft-amm-order-v2-2.1.0-[0-9a-f]*\.dalf'
 ```
 
 The name of the main `.dalf` file contains the package ID. After you upload the DAR, check that the package ID on your participant is the same.
